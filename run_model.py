@@ -124,15 +124,14 @@ def process_contxt_batch(qids, idx_set):
     max_title_len, max_body_len = 0, 0
     title_len, body_len = [], []
     counter = 0
-#     y = []
     
     for qid in qids:
         
         q_title, q_body = context_repre[qid]['t'], context_repre[qid]['b']
         q_pos = idx_set[qid]['pos']
         
-        if len(q_pos) > 20:
-            q_pos = q_pos[:20]
+        if len(q_pos) > 10:
+            q_pos = q_pos[:10]
 
         for qid_pos in q_pos:
 
@@ -147,7 +146,7 @@ def process_contxt_batch(qids, idx_set):
                 batch_body += [ q_body ]
                 body_len += [len(q_body)]
                 max_body_len = max(max_body_len, len(q_body))
-#             y += [1]
+
             # pos Q
             title, body = context_repre[qid_pos]['t'], context_repre[qid_pos]['b']
             title_len += [len(title)]
@@ -160,7 +159,7 @@ def process_contxt_batch(qids, idx_set):
                 batch_body += [ body ]
                 body_len += [len(body)]
                 max_body_len = max(max_body_len, len(body))
-#             y += [1]
+
             # neg Q
             q_neg = idx_set[qid]['neg']
             q_neg_sample_indices = np.random.choice(range(100), size=20)
@@ -178,7 +177,7 @@ def process_contxt_batch(qids, idx_set):
                     batch_body += [ body ]
                     body_len += [len(body)]
                     max_body_len = max(max_body_len, len(body))
-#                 y += [0]
+
     # (max_seq_len, batch_size, feature_len)
     padded_batch_title = np.zeros(( max_title_len, len(batch_title), 200)) 
     padded_batch_body = np.zeros(( max_body_len, len(batch_body),  200))
@@ -293,8 +292,20 @@ def MRR(labels):
                 scores.append(1.0/(i+1))
                 break
     return sum(scores)/len(scores) if len(scores) > 0 else 0.0
-
-def do_eval(eval_map, eval_data, embedding_layer, eval_name):
+    
+def do_eval(embedding_layer, eval_name, batch_first=False):
+    
+    if eval_name == 'Dev':
+        eval_data = dev_data
+        eval_map = {}
+        for qid_ in dev_data.keys():
+            eval_map[qid_] = process_eval_batch(qid_, dev_data, batch_first=batch_first)
+            
+    elif eval_name == 'Test':
+        eval_data = test_data
+        eval_map = {}
+        for qid_ in test_data.keys():
+            eval_map[qid_] = process_eval_batch(qid_, test_data, batch_first=batch_first)
     
     labels = []
     
@@ -303,24 +314,17 @@ def do_eval(eval_map, eval_data, embedding_layer, eval_name):
         eval_title_batch, eval_body_batch, eval_title_len, eval_body_len = eval_map[qid_] # process_eval_batch(qid_, eval_data)
         embedding_layer.title_hidden = embedding_layer.init_hidden(eval_title_batch.shape[1])
         embedding_layer.body_hidden = embedding_layer.init_hidden(eval_body_batch.shape[1])
-
         eval_title_qs = Variable(torch.FloatTensor(eval_title_batch))
         eval_body_qs = Variable(torch.FloatTensor(eval_body_batch))
-        if cuda_available:
-            eval_title_qs = eval_title_qs.cuda()
-            eval_body_qs = eval_body_qs.cuda()
-
         embeddings = embedding_layer(eval_title_qs, eval_body_qs, eval_title_len, eval_body_len)
         cos_scores = evaluate(embeddings)
-        if cuda_available:
-            cos_scores = cos_scores.cpu()
         labels.append(np.array(eval_data[qid_]['label'])[np.argsort(cos_scores.data.numpy())][::-1])
-
+    
     print (eval_name + ' Performance MAP', MAP(labels))
     print (eval_name + ' Performance MRR', MRR(labels))
     print (eval_name + ' Performance P@1', precision(1, labels))
     print (eval_name + ' Performance P@5', precision(5, labels))
-    
+
 
 # DEV SET
 dev = read_annotations('data/dev.txt')
@@ -356,17 +360,30 @@ def build_mask(seq_len):
         mask += [s_mask]
     return mask
 
-def build_mask3d(seq_len):
-    mask = np.zeros((np.max(seq_len), len(seq_len), 1))
+# def build_mask3d(seq_len):
+#     mask = np.zeros((np.max(seq_len), len(seq_len), 1))
+#     for i, s in enumerate(seq_len):
+#         mask[:int(s), i] = np.ones((int(s), 1))
+#     return mask
+
+def build_mask3d(seq_len, max_len):
+    mask = np.zeros((max_len, len(seq_len), 1))
     for i, s in enumerate(seq_len):
-        mask[:int(s), i] = np.ones((int(s), 1))
+        # only one word
+        if int(s) == -1:
+            mask[0, i] = 1
+        # only two word
+        elif int(s) == 0:
+            mask[:2, i] = np.ones((2, 1))
+        else: 
+            mask[:int(s), i] = np.ones((int(s), 1))
     return mask
 
-def multi_margin_loss(margin=0.30):
+def multi_margin_loss(hidden, margin=0.30):
     
     def loss_func(embeddings):
         # a batch of embeddings
-        blocked_embeddings = embeddings.view(-1, 22, HIDDEN_DIM *2)
+        blocked_embeddings = embeddings.view(-1, 22, hidden)
         q_vecs = blocked_embeddings[:,0,:]
         pos_vecs = blocked_embeddings[:,1,:]
         neg_vecs = blocked_embeddings[:,2:,:]
@@ -386,14 +403,24 @@ def multi_margin_loss(margin=0.30):
 
 class EmbeddingLayer(nn.Module):
     
-    def __init__(self, input_size, hidden_size, layer_type, num_layer=1, kernel_size=None):
+    def __init__(self, input_size, hidden_size, layer_type, num_layer=1, kernel_size=3):
         
         super(EmbeddingLayer, self).__init__()
         
+        # self.num_layer = num_layer
+        
+        # self.hidden_size = hidden_size
+        # self.kernel_size = kernel_size
+
         self.num_layer = num_layer
         
+        self.layer_type = layer_type
+        
+        self.input_size = input_size
         self.hidden_size = hidden_size
         self.kernel_size = kernel_size
+        
+        self.tanh = nn.Tanh()
         
         if layer_type == 'lstm':
             
@@ -401,15 +428,14 @@ class EmbeddingLayer(nn.Module):
             #self.title_embedding_layer = nn.LSTM(input_size, hidden_size)
             #self.body_embedding_layer = nn.LSTM(input_size, hidden_size)
             self.embedding_layer = nn.LSTM(input_size, hidden_size, bidirectional=True)
-            self.tanh = nn.Tanh()
         
         elif layer_type == 'cnn':
             self.layer_type = 'cnn'
             self.embedding_layer = nn.Sequential(
                         nn.Conv1d(in_channels = 200,
                                   out_channels = self.hidden_size,
-                                  kernel_size = kernel_size),
-                        nn.Tanh())
+                                  kernel_size = self.kernel_size),
+                        self.tanh)
 
     def init_hidden(self, batch_size):
         hidden = Variable(torch.zeros(self.num_layer*2, batch_size, self.hidden_size))
@@ -423,28 +449,47 @@ class EmbeddingLayer(nn.Module):
             
         if self.layer_type == 'lstm':
             
+            title_mask = Variable(torch.FloatTensor(build_mask3d(title_len, np.max(seq_len))))
+            body_mask = Variable(torch.FloatTensor(build_mask3d(body_len, np.max(body_len))))
             
-            title_lstm_out, self.title_hidden = self.embedding_layer(title, (self.tanh(self.title_hidden[0]), \
+            
+            title_out, self.title_hidden = self.embedding_layer(title, (self.tanh(self.title_hidden[0]), \
                                                                    self.tanh(self.title_hidden[1])))
-            body_lstm_out, self.body_hidden = self.embedding_layer(body, (self.tanh(self.body_hidden[0]), \
-                                                                   self.tanh(self.body_hidden[1])))
-            
-            
-            title_mask = Variable(torch.FloatTensor(build_mask3d(title_len)))
-            body_mask = Variable(torch.FloatTensor(build_mask3d(body_len)))
+            body_out, self.body_hidden = self.embedding_layer(body, (self.tanh(self.body_hidden[0]), \
+                                                                   self.tanh(self.body_hidden[1])))    
 
-            if cuda_available:
-                title_mask = title_mask.cuda()
-                body_mask = body_mask.cuda()
+        if self.layer_type == 'cnn':
 
-            title_embeddings = torch.sum(title_lstm_out * title_mask, dim=0) / torch.sum(title_mask, dim=0)
-            body_embeddings = torch.sum(body_lstm_out * body_mask, dim=0) / torch.sum(body_mask, dim=0)
+
+            # batch first input
+            title_mask = Variable(torch.FloatTensor(build_mask3d(title_len - self.kernel_size + 1,\
+                                                                 np.max(title_len) - self.kernel_size + 1)))
+            body_mask = Variable(torch.FloatTensor(build_mask3d(body_len - self.kernel_size + 1, \
+                                                                np.max(body_len) - self.kernel_size + 1)))
             
-            embeddings = ( title_embeddings + body_embeddings ) / 2
-            if cuda_available:
-                embeddings = embeddings.cuda()
+            title = torch.transpose(title, 1, 2)
+            body = torch.transpose(body, 1, 2)
 
-            return embeddings
+            title_out =  self.embedding_layer(title)
+            body_out =  self.embedding_layer(body)
+
+            title_out = torch.transpose(title_out, 1, 2)
+            body_out = torch.transpose(body_out, 1, 2)
+
+            title_out = torch.transpose(title_out, 0, 1)
+            body_out = torch.transpose(body_out, 0, 1)
+        
+        # if cuda_available:
+        #     title_mask = title_mask.cuda()
+        #     body_mask = body_mask.cuda()
+        print(title_out.size(), title_mask.size())
+        title_embeddings = torch.sum(title_out * title_mask, dim=0) / torch.sum(title_mask, dim=0)
+        body_embeddings = torch.sum(body_out * body_mask, dim=0) / torch.sum(body_mask, dim=0)
+        
+        embeddings = ( title_embeddings + body_embeddings ) / 2
+        if cuda_available:
+            embeddings = embeddings.cuda()    
+        return embeddings
 
 def save_model(mdl, path):
     # saving model params
@@ -465,7 +510,7 @@ def train(layer_type, embedding_layer, batch_size=25, margin=0.3,
         
     optimizer = torch.optim.Adam(embedding_layer.parameters(), lr=0.001)
     # criterion = torch.nn.MultiMarginLoss()
-    criterion = multi_margin_loss(margin)
+    criterion = multi_margin_loss(hidden=embedding_layer.hidden_size, margin=margin)
     
     qids = list(id_set.keys())
     num_batch = len(qids) // batch_size
@@ -503,19 +548,31 @@ def train(layer_type, embedding_layer, batch_size=25, margin=0.3,
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        
-            if eval and batch_idx % 100 == 0: # lstm for now
+
+
+            if eval and batch_idx % 1 == 0: # lstm for now
                 print ('evaluating ....')
-                do_eval(dev_map, dev_data, embedding_layer, 'Dev')
-                print ('------------------')
-                do_eval(test_map, test_data, embedding_layer, 'Test')
+                if layer_type == 'lstm':
+                    do_eval(embedding_layer, 'Dev')
+                    print ('------------------')
+                    do_eval(embedding_layer, 'Test')
+                elif layer_type == 'cnn':
+                    do_eval(embedding_layer, 'Dev', batch_first=True)
+                    print ('------------------')
+                    do_eval(embedding_layer, 'Test', batch_first=True)
+            
+            del loss, embeddings, title_qs, body_qs, embedding_layer.title_hidden, embedding_layer.body_hidden
 
         if eval: # lstm for now
             print ('Epoch {} is finished'.format(epoch))
-            print ('evaluating ....')
-            do_eval(dev_map, dev_data, embedding_layer, 'Dev')
-            print ('------------------')
-            do_eval(test_map, test_data, embedding_layer, 'Test')
+            if layer_type == 'lstm':
+                do_eval(embedding_layer, 'Dev')
+                print ('------------------')
+                do_eval(embedding_layer, 'Test')
+            elif layer_type == 'cnn':
+                do_eval(embedding_layer, 'Dev', batch_first=True)
+                print ('------------------')
+                do_eval(embedding_layer, 'Test', batch_first=True)
 
 if __name__ == '__main__':
     parser = OptionParser()
@@ -540,12 +597,21 @@ if __name__ == '__main__':
         batch_size, epoch, margin, model_option))
     print('Start Training...')
     
-    model = EmbeddingLayer(200, HIDDEN_DIM, model_option) # loss margin = 0.5
-    if cuda_available:
-        model = model.cuda()
-    train(model_option, model, batch_size=batch_size, num_epoch=epoch, margin=margin)
+    if model_option == 'lstm':
+        model = EmbeddingLayer(200, HIDDEN_DIM*2, 'lstm')
+        criterion = multi_margin_loss(hidden=model.hidden_size * 2)
+        if cuda_available:
+            model = model.cuda()
+        train(model_option, model, batch_size=batch_size, num_epoch=epoch, margin=margin)
+    
+    elif model_option == 'cnn':  
+        model = EmbeddingLayer(200, HIDDEN_DIM, 'cnn')
+        criterion = multi_margin_loss(hidden=model.hidden_size)
+        if cuda_available:
+            model = model.cuda()
+        train(model_option, model, batch_size=batch_size, num_epoch=epoch, margin=margin)
 
-    save_model(model, 'models/lstm_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(hidden_size))
+    save_model(model, 'models/lstm_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM))
 
 
 
