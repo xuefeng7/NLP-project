@@ -449,7 +449,7 @@ class EmbeddingLayer(nn.Module):
             
         if self.layer_type == 'lstm':
             
-            title_mask = Variable(torch.FloatTensor(build_mask3d(title_len, np.max(seq_len))))
+            title_mask = Variable(torch.FloatTensor(build_mask3d(title_len, np.max(title_len))))
             body_mask = Variable(torch.FloatTensor(build_mask3d(body_len, np.max(body_len))))
             
             
