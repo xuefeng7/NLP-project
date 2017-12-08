@@ -10,8 +10,25 @@ import time
 from optparse import OptionParser
 import pickle as pkl
 
+parser = OptionParser()
+parser.add_option("--batch_size", dest="batch_size", default="25")
+parser.add_option("--hidden_size", dest="hidden_size", default="120")
+parser.add_option("--epoch", dest="epoch", default="20")
+parser.add_option("--margin", dest="margin", default="0.3")
+parser.add_option("--learning_rate", dest="learning_rate", default="5e-4")
+parser.add_option("--print_every", dest="print_every", default="100")
+parser.add_option("--model_option", dest="model_option", default="lstm")
+opts,args = parser.parse_args()
 
-HIDDEN_DIM = 120
+batch_size = int(opts.batch_size)
+hidden_size = int(opts.hidden_size)
+epoch = int(opts.epoch)
+margin = float(opts.margin)
+learning_rate = float(opts.learning_rate)
+print_every = int(opts.print_every)
+model_option = opts.model_option
+
+HIDDEN_DIM = hidden_size
 
 cuda_available = torch.cuda.is_available()
 var_torch = torch.cuda.FloatTensor(1) if cuda_available else torch.FloatTensor(1)
@@ -118,23 +135,21 @@ def contxt2vec(title, body=None):
     
     return title_v, None
 
-def process_contxt_batch(qids, idx_set):
+def process_contxt_batch(qids, idx_set, batch_first=False):
     
     batch_title, batch_body = [], []
     max_title_len, max_body_len = 0, 0
     title_len, body_len = [], []
-    counter = 0
     
     for qid in qids:
         
         q_title, q_body = context_repre[qid]['t'], context_repre[qid]['b']
         q_pos = idx_set[qid]['pos']
         
-        if len(q_pos) > 10:
-            q_pos = q_pos[:10]
+        if len(q_pos) > 20:
+            q_pos = q_pos[:20]
 
         for qid_pos in q_pos:
-
             # query Q
             title_len += [len(q_title)]
             batch_title += [ q_title ]
@@ -146,7 +161,7 @@ def process_contxt_batch(qids, idx_set):
                 batch_body += [ q_body ]
                 body_len += [len(q_body)]
                 max_body_len = max(max_body_len, len(q_body))
-
+                
             # pos Q
             title, body = context_repre[qid_pos]['t'], context_repre[qid_pos]['b']
             title_len += [len(title)]
@@ -159,7 +174,6 @@ def process_contxt_batch(qids, idx_set):
                 batch_body += [ body ]
                 body_len += [len(body)]
                 max_body_len = max(max_body_len, len(body))
-
             # neg Q
             q_neg = idx_set[qid]['neg']
             q_neg_sample_indices = np.random.choice(range(100), size=20)
@@ -177,16 +191,25 @@ def process_contxt_batch(qids, idx_set):
                     batch_body += [ body ]
                     body_len += [len(body)]
                     max_body_len = max(max_body_len, len(body))
-
-    # (max_seq_len, batch_size, feature_len)
-    padded_batch_title = np.zeros(( max_title_len, len(batch_title), 200)) 
-    padded_batch_body = np.zeros(( max_body_len, len(batch_body),  200))
     
-    for i, (title, body) in enumerate(zip(batch_title, batch_body)):
-        title_repre, body_repre = contxt2vec(title, body)
-        padded_batch_title[:title_len[i], i] = title_repre
-        padded_batch_body[:body_len[i], i] = body_repre
-    #np.array(y).reshape(-1,1)
+    if batch_first:
+        # for CNN
+        padded_batch_title = np.zeros(( len(batch_title), max_title_len, 200)) 
+        padded_batch_body = np.zeros(( len(batch_body),  max_body_len, 200))
+        for i, (title, body) in enumerate(zip(batch_title, batch_body)):
+            title_repre, body_repre = contxt2vec(title, body)
+            padded_batch_title[i, :title_len[i]] = title_repre
+            padded_batch_body[i, :body_len[i]] = body_repre
+    else:
+        # for LSTM
+        # (max_seq_len, batch_size, feature_len)
+        padded_batch_title = np.zeros(( max_title_len, len(batch_title), 200)) 
+        padded_batch_body = np.zeros(( max_body_len, len(batch_body),  200))
+        for i, (title, body) in enumerate(zip(batch_title, batch_body)):
+            title_repre, body_repre = contxt2vec(title, body)
+            padded_batch_title[:title_len[i], i] = title_repre
+            padded_batch_body[:body_len[i], i] = body_repre
+
     return padded_batch_title, padded_batch_body, \
                 np.array(title_len).reshape(-1,1), np.array(body_len).reshape(-1,1)
 
@@ -221,9 +244,8 @@ def read_annotations(path, K_neg=20, prune_pos_cnt=20):
 
 def cos_sim(qv, qv_):
     return torch.sum(qv * qv_, dim=1) / (torch.sqrt(torch.sum(qv ** 2, dim=1)) * torch.sqrt(torch.sum(qv_ ** 2, dim=1)))
-    
-# create eval batch 
-def process_eval_batch(qid, data):
+
+def process_eval_batch(qid, data, batch_first=False):
     qid_dict = data[qid]
     qs = qid_dict['q']
     max_title_len, max_body_len = 0, 0
@@ -241,14 +263,21 @@ def process_eval_batch(qid, data):
             batch_body += [ body ]
             body_len += [len(body)]
             max_body_len = max(max_body_len, len(body))
-        
-    padded_batch_title = np.zeros(( max_title_len, len(batch_title), 200)) 
-    padded_batch_body = np.zeros(( max_body_len, len(batch_body),  200))
-    
-    for i, (title, body) in enumerate(zip(batch_title, batch_body)):
-        title_repre, body_repre = contxt2vec(title, body)
-        padded_batch_title[:title_len[i], i] = title_repre
-        padded_batch_body[:body_len[i], i] = body_repre
+            
+    if batch_first:
+        padded_batch_title = np.zeros(( len(batch_title), max_title_len, 200)) 
+        padded_batch_body = np.zeros(( len(batch_body),  max_body_len, 200))
+        for i, (title, body) in enumerate(zip(batch_title, batch_body)):
+            title_repre, body_repre = contxt2vec(title, body)
+            padded_batch_title[i, :title_len[i]] = title_repre
+            padded_batch_body[i, :body_len[i]] = body_repre
+    else:
+        padded_batch_title = np.zeros(( max_title_len, len(batch_title), 200)) 
+        padded_batch_body = np.zeros(( max_body_len, len(batch_body),  200))
+        for i, (title, body) in enumerate(zip(batch_title, batch_body)):
+            title_repre, body_repre = contxt2vec(title, body)
+            padded_batch_title[:title_len[i], i] = title_repre
+            padded_batch_body[:body_len[i], i] = body_repre
     
     return padded_batch_title, padded_batch_body, \
            np.array(title_len).reshape(-1,1), np.array(body_len).reshape(-1,1) 
@@ -316,8 +345,13 @@ def do_eval(embedding_layer, eval_name, batch_first=False):
         embedding_layer.body_hidden = embedding_layer.init_hidden(eval_body_batch.shape[1])
         eval_title_qs = Variable(torch.FloatTensor(eval_title_batch))
         eval_body_qs = Variable(torch.FloatTensor(eval_body_batch))
+
+        if cuda_available:
+            eval_title_qs, eval_body_qs = eval_title_qs.cuda(), eval_body_qs.cuda()
         embeddings = embedding_layer(eval_title_qs, eval_body_qs, eval_title_len, eval_body_len)
         cos_scores = evaluate(embeddings)
+        if cuda_available:
+            cos_scores = cos_scores.cpu()
         labels.append(np.array(eval_data[qid_]['label'])[np.argsort(cos_scores.data.numpy())][::-1])
     
     print (eval_name + ' Performance MAP', MAP(labels))
@@ -360,12 +394,6 @@ def build_mask(seq_len):
         mask += [s_mask]
     return mask
 
-# def build_mask3d(seq_len):
-#     mask = np.zeros((np.max(seq_len), len(seq_len), 1))
-#     for i, s in enumerate(seq_len):
-#         mask[:int(s), i] = np.ones((int(s), 1))
-#     return mask
-
 def build_mask3d(seq_len, max_len):
     mask = np.zeros((max_len, len(seq_len), 1))
     for i, s in enumerate(seq_len):
@@ -406,11 +434,6 @@ class EmbeddingLayer(nn.Module):
     def __init__(self, input_size, hidden_size, layer_type, num_layer=1, kernel_size=3):
         
         super(EmbeddingLayer, self).__init__()
-        
-        # self.num_layer = num_layer
-        
-        # self.hidden_size = hidden_size
-        # self.kernel_size = kernel_size
 
         self.num_layer = num_layer
         
@@ -425,8 +448,6 @@ class EmbeddingLayer(nn.Module):
         if layer_type == 'lstm':
             
             self.layer_type = 'lstm'
-            #self.title_embedding_layer = nn.LSTM(input_size, hidden_size)
-            #self.body_embedding_layer = nn.LSTM(input_size, hidden_size)
             self.embedding_layer = nn.LSTM(input_size, hidden_size, bidirectional=True)
         
         elif layer_type == 'cnn':
@@ -460,8 +481,6 @@ class EmbeddingLayer(nn.Module):
 
         if self.layer_type == 'cnn':
 
-
-            # batch first input
             title_mask = Variable(torch.FloatTensor(build_mask3d(title_len - self.kernel_size + 1,\
                                                                  np.max(title_len) - self.kernel_size + 1)))
             body_mask = Variable(torch.FloatTensor(build_mask3d(body_len - self.kernel_size + 1, \
@@ -479,16 +498,17 @@ class EmbeddingLayer(nn.Module):
             title_out = torch.transpose(title_out, 0, 1)
             body_out = torch.transpose(body_out, 0, 1)
         
-        # if cuda_available:
-        #     title_mask = title_mask.cuda()
-        #     body_mask = body_mask.cuda()
-        print(title_out.size(), title_mask.size())
+        if cuda_available:
+            title_out, body_out = title_out.cpu(), body_out.cpu()
+            # title_mask = title_mask.cuda()
+            # body_mask = body_mask.cuda()
+        # print(title_out.size(), title_mask.size())
         title_embeddings = torch.sum(title_out * title_mask, dim=0) / torch.sum(title_mask, dim=0)
         body_embeddings = torch.sum(body_out * body_mask, dim=0) / torch.sum(body_mask, dim=0)
         
         embeddings = ( title_embeddings + body_embeddings ) / 2
         if cuda_available:
-            embeddings = embeddings.cuda()    
+            embeddings = embeddings.cuda()
         return embeddings
 
 def save_model(mdl, path):
@@ -498,59 +518,51 @@ def save_model(mdl, path):
 def restore_model(mdl_skeleton, path):
     # restoring params to the mdl skeleton
     mdl_skeleton.load_state_dict(torch.load(path))
-    return mdl
 
 def train(layer_type, embedding_layer, batch_size=25, margin=0.3,
           num_epoch=100, id_set=train_idx_set, eval=True):
-    
-#     if layer_type == 'lstm':
-#         embedding_layer = EmbeddingLayer(200, 240, 'lstm')
-#     elif layer_type == 'cnn':
-#         embedding_layer = EmbeddingLayer(200, 240, 'cnn', kernel_size=3)
         
     optimizer = torch.optim.Adam(embedding_layer.parameters(), lr=0.001)
-    # criterion = torch.nn.MultiMarginLoss()
     criterion = multi_margin_loss(hidden=embedding_layer.hidden_size, margin=margin)
     
     qids = list(id_set.keys())
     num_batch = len(qids) // batch_size
-    
+    last_loss = np.inf
     for epoch in range(1, num_epoch + 1):
-        
+        cumulative_loss = 0
         for batch_idx in range(1, num_batch + 1):
             batch_x_qids = qids[ ( batch_idx - 1 ) * batch_size: batch_idx * batch_size ]
-            batch_title, batch_body, title_len, body_len = process_contxt_batch(batch_x_qids, train_idx_set)
+            
             if layer_type == 'lstm':
+                batch_title, batch_body, title_len, body_len = process_contxt_batch(batch_x_qids, \
+                                                                                train_idx_set)
                 embedding_layer.title_hidden = embedding_layer.init_hidden(batch_title.shape[1])
                 embedding_layer.body_hidden = embedding_layer.init_hidden(batch_body.shape[1])
-            
+            else:
+                batch_title, batch_body, title_len, body_len = process_contxt_batch(batch_x_qids, \
+                                                                                train_idx_set, batch_first=True)
+
             title_qs = Variable(torch.FloatTensor(batch_title))#, requires_grad=True)
             body_qs = Variable(torch.FloatTensor(batch_body))#, requires_grad=True)
             if cuda_available:
                 title_qs = title_qs.cuda()
                 body_qs = body_qs.cuda()
             embeddings = embedding_layer(title_qs, body_qs, title_len, body_len)
-#             blocked_embeddings = embeddings.view(-1, 22, HIDDEN_DIM * 2)
-#             q_vecs = blocked_embeddings[:,0,:]
-#             pos_neg_vecs = blocked_embeddings[:,1:,:]
-            
-#             # cosine similarity
-#             scores = torch.sum(torch.unsqueeze(q_vecs, dim=1) * pos_neg_vecs, dim=2) \
-#                 / (torch.unsqueeze(torch.sqrt(torch.sum(q_vecs ** 2, dim=1)), dim=1) *\
-#                    torch.sqrt(torch.sum( pos_neg_vecs ** 2, dim=2)))
-#             target = Variable(torch.zeros(scores.size(0)).type(torch.LongTensor)) 
+
             loss = criterion(embeddings)
+            cumulative_loss += loss.cpu().data.numpy()[0]
             if cuda_available:
                 loss = loss.cuda()
-            #loss = criterion(scores, target)
+
             if batch_idx % 20 == 1:
-                print ('epoch:{}/{}, batch:{}/{}, loss:{}'.format(epoch, num_epoch, batch_idx, num_batch, loss.data[0]))
+                print ('epoch:{}/{}, batch:{}/{}, loss:{}'.format(epoch+1, num_epoch+1, batch_idx, num_batch, loss.data[0]))
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
 
-            if eval and batch_idx % 1 == 0: # lstm for now
+            if eval and batch_idx % print_every == 0: # lstm for now
                 print ('evaluating ....')
                 if layer_type == 'lstm':
                     do_eval(embedding_layer, 'Dev')
@@ -561,7 +573,9 @@ def train(layer_type, embedding_layer, batch_size=25, margin=0.3,
                     print ('------------------')
                     do_eval(embedding_layer, 'Test', batch_first=True)
             
-            del loss, embeddings, title_qs, body_qs, embedding_layer.title_hidden, embedding_layer.body_hidden
+            del loss, embeddings, title_qs, body_qs
+            if layer_type == 'lstm':
+                del embedding_layer.title_hidden, embedding_layer.body_hidden
 
         if eval: # lstm for now
             print ('Epoch {} is finished'.format(epoch))
@@ -573,28 +587,16 @@ def train(layer_type, embedding_layer, batch_size=25, margin=0.3,
                 do_eval(embedding_layer, 'Dev', batch_first=True)
                 print ('------------------')
                 do_eval(embedding_layer, 'Test', batch_first=True)
+        if cumulative_loss < last_loss:
+            last_loss = cumulative_loss
+        else:
+            print('Last loss', last_loss, '/ Current loss', cumulative_loss)
+            break
 
 if __name__ == '__main__':
-    parser = OptionParser()
-    parser.add_option("--batch_size", dest="batch_size", default="25")
-    # parser.add_option("--hidden_size", dest="hidden_size", default="120")
-    parser.add_option("--epoch", dest="epoch", default="20")
-    parser.add_option("--margin", dest="margin", default="0.3")
-    parser.add_option("--learning_rate", dest="learning_rate", default="5e-4")
-    parser.add_option("--print_iters", dest="print_iters", default="100")
-    parser.add_option("--model_option", dest="model_option", default="lstm")
-    opts,args = parser.parse_args()
 
-    batch_size = int(opts.batch_size)
-    # hidden_size = int(opts.hidden_size)
-    epoch = int(opts.epoch)
-    margin = float(opts.margin)
-    learning_rate = float(opts.learning_rate)
-    print_iters = int(opts.print_iters)
-    model_option = opts.model_option
-
-    print('batch_size={}, epoch={}, margin={}, model={}'.format( \
-        batch_size, epoch, margin, model_option))
+    print('batch_size={}, epoch={}, margin={}, model={}, hidden_size={}'.format( \
+        batch_size, epoch, margin, model_option, HIDDEN_DIM))
     print('Start Training...')
     
     if model_option == 'lstm':
@@ -606,12 +608,14 @@ if __name__ == '__main__':
     
     elif model_option == 'cnn':  
         model = EmbeddingLayer(200, HIDDEN_DIM, 'cnn')
+        # restore_model(model, 'models/lstm_bi_epoch=1_margin=0.3_hidden=667')
         criterion = multi_margin_loss(hidden=model.hidden_size)
         if cuda_available:
             model = model.cuda()
         train(model_option, model, batch_size=batch_size, num_epoch=epoch, margin=margin)
-
-    save_model(model, 'models/lstm_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM))
+    print ('Saving Model...')
+    save_model(model, 'models/'+str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+'_0')
+    print ('Done')
 
 
 
