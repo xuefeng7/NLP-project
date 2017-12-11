@@ -9,6 +9,8 @@ import re
 import time
 from optparse import OptionParser
 import pickle as pkl
+import time
+from meter import AUCMeter
 
 parser = OptionParser()
 parser.add_option("--batch_size", dest="batch_size", default="25")
@@ -18,6 +20,9 @@ parser.add_option("--margin", dest="margin", default="0.3")
 parser.add_option("--learning_rate", dest="learning_rate", default="5e-4")
 parser.add_option("--print_every", dest="print_every", default="100")
 parser.add_option("--model_option", dest="model_option", default="lstm")
+parser.add_option("--restore", dest="restore", default=None)
+parser.add_option("--is_android", dest="is_android", default=False)
+parser.add_option("--eval_only", dest="eval_only", default=False)
 opts,args = parser.parse_args()
 
 batch_size = int(opts.batch_size)
@@ -27,6 +32,9 @@ margin = float(opts.margin)
 learning_rate = float(opts.learning_rate)
 print_every = int(opts.print_every)
 model_option = opts.model_option
+restore = opts.restore
+is_android = opts.is_android
+eval_only = opts.eval_only
 
 HIDDEN_DIM = hidden_size
 
@@ -48,13 +56,38 @@ print ('Cuda is available: {}'.format(cuda_available))
 #     w2i_map[key] = i
 #     w2v_matrix[i] = val
 
-with open('data/w2i_map.pkl', 'rb') as f:
+w2i_map_path = 'data/w2i_map.pkl'
+w2v_matrix_path = 'data/w2v_matrix.pkl'
+context_repre_path = 'data/context_repre.pkl'
+
+if is_android:
+    # dot_idx = w2i_map_path.find('.')
+    # w2i_map_path = w2i_map_path[:dot_idx] + '_android' + w2i_map_path[dot_idx:]
+    # dot_idx = w2v_matrix_path.find('.')
+    # w2v_matrix_path = w2v_matrix_path[:dot_idx] + '_android' + w2v_matrix_path[dot_idx:]
+    dot_idx = context_repre_path.find('.')
+    context_repre_path = context_repre_path[:dot_idx] + '_android' + context_repre_path[dot_idx:]
+
+def build_context_repre(path):
+    context_repre = {}
+    with open('data/' + path, 'r') as src:
+        src = src.read().strip().split('\n')
+        for line in src:
+            context = line.strip().split('\t')
+            qid = context.pop(0)
+            if len(context) == 1:
+                context_repre[int(qid)] = {'t': sen2w(context[0]), 'b': None}
+            else:
+                context_repre[int(qid)] = {'t':sen2w(context[0]), 'b': sen2w(context[1])}
+    return context_repre
+
+with open(w2i_map_path, 'rb') as f:
     w2i_map = pkl.load(f)
 
-with open('data/w2v_matrix.pkl', 'rb') as f:
+with open(w2v_matrix_path, 'rb') as f:
     w2v_matrix = pkl.load(f)
 
-with open('data/context_repre.pkl', 'rb') as f:
+with open(context_repre_path, 'rb') as f:
     context_repre = pkl.load(f)
 
 def w2v(w):
@@ -244,6 +277,54 @@ def read_annotations(path, K_neg=20, prune_pos_cnt=20):
 def cos_sim(qv, qv_):
     return torch.sum(qv * qv_, dim=1) / (torch.sqrt(torch.sum(qv ** 2, dim=1)) * torch.sqrt(torch.sum(qv_ ** 2, dim=1)))
 
+# functions for android dataset
+def build_corpus(path):
+    title_corpus = []
+    body_corpus = []
+    idx_corpus = []
+    with open('data/' + path, 'r') as src:
+        src = src.read().strip().split('\n')
+        for line in src:
+            context = line.strip().split('\t')
+            qid = context.pop(0)
+            title_corpus.append(context[0])
+            body_corpus.append(context[1] if len(context)!=1 else '')
+            idx_corpus.append(int(qid))
+    return title_corpus, body_corpus, {k: v for v, k in enumerate(idx_corpus)}
+
+def score_from_idx(idx1, idx2, embedding):
+    v1 = embedding[android_idx[idx1]]
+    v2 = embedding[android_idx[idx2]]
+    return (v1 @ v2.T).toarray()[0][0] / \
+            (sp.linalg.norm(v1)*sp.linalg.norm(v2))
+
+def read_annotations_android(pos_path, neg_path):
+    dic = {}
+    with open('data/android/' + pos_path) as src:
+        src = src.read().strip().split('\n')
+        for line in src:
+            indices = line.strip().split()
+            idx1, idx2 = int(indices[0]), int(indices[1])
+            if idx1 not in dic:
+                dic[idx1] = {}
+                dic[idx1]['q'] = []
+                dic[idx1]['label'] = []
+            dic[idx1]['q'].append(idx2)
+            dic[idx1]['label'].append(1)
+    with open('data/android/' + neg_path) as src:
+        src = src.read().strip().split('\n')
+        for line in src:
+            indices = line.strip().split()
+            idx1, idx2 = int(indices[0]), int(indices[1])
+            if idx1 not in dic:
+                dic[idx1] = {}
+                dic[idx1]['q'] = []
+                dic[idx1]['label'] = []
+            dic[idx1]['q'].append(idx2)
+            dic[idx1]['label'].append(0)
+    return dic
+
+
 def process_eval_batch(qid, data, batch_first=False):
     qid_dict = data[qid]
     qs = qid_dict['q']
@@ -320,44 +401,6 @@ def MRR(labels):
                 scores.append(1.0/(i+1))
                 break
     return sum(scores)/len(scores) if len(scores) > 0 else 0.0
-    
-def do_eval(embedding_layer, eval_name, batch_first=False):
-    
-    if eval_name == 'Dev':
-        eval_data = dev_data
-        eval_map = {}
-        for qid_ in dev_data.keys():
-            eval_map[qid_] = process_eval_batch(qid_, dev_data, batch_first=batch_first)
-            
-    elif eval_name == 'Test':
-        eval_data = test_data
-        eval_map = {}
-        for qid_ in test_data.keys():
-            eval_map[qid_] = process_eval_batch(qid_, test_data, batch_first=batch_first)
-    
-    labels = []
-    
-    for qid_ in eval_map.keys():
-        
-        eval_title_batch, eval_body_batch, eval_title_len, eval_body_len = eval_map[qid_] # process_eval_batch(qid_, eval_data)
-        embedding_layer.title_hidden = embedding_layer.init_hidden(eval_title_batch.shape[1])
-        embedding_layer.body_hidden = embedding_layer.init_hidden(eval_body_batch.shape[1])
-        eval_title_qs = Variable(torch.FloatTensor(eval_title_batch))
-        eval_body_qs = Variable(torch.FloatTensor(eval_body_batch))
-
-        if cuda_available:
-            eval_title_qs, eval_body_qs = eval_title_qs.cuda(), eval_body_qs.cuda()
-        embeddings = embedding_layer(eval_title_qs, eval_body_qs, eval_title_len, eval_body_len)
-        cos_scores = evaluate(embeddings)
-        if cuda_available:
-            cos_scores = cos_scores.cpu()
-        labels.append(np.array(eval_data[qid_]['label'])[np.argsort(cos_scores.data.numpy())][::-1])
-    
-    print (eval_name + ' Performance MAP', MAP(labels))
-    print (eval_name + ' Performance MRR', MRR(labels))
-    print (eval_name + ' Performance P@1', precision(1, labels))
-    print (eval_name + ' Performance P@5', precision(5, labels))
-
 
 # DEV SET
 dev = read_annotations('data/dev.txt')
@@ -377,13 +420,87 @@ for item in test:
     test_data[qid]['q'] = list(map(int, item[1]))
     test_data[qid]['label'] = item[2]
 
-dev_map = {}
-for qid_ in dev_data.keys():
-    dev_map[qid_] = process_eval_batch(qid_, dev_data)
+# DEV SET
+dev_android = read_annotations_android('dev.pos.txt', 'dev.neg.txt')
 
-test_map = {}
-for qid_ in test_data.keys():
-    test_map[qid_] = process_eval_batch(qid_, test_data)
+# TEST SET
+test_android = read_annotations_android('test.pos.txt', 'test.neg.txt')
+
+def eval_metrics(labels, eval_name):
+    # labels = [] 
+    # for qid in eval_set.keys():
+    #     labels.append(np.array(eval_set[qid]['target'])[np.argsort(eval_set[qid]['score'])][::-1])
+    print (eval_name + ' Performance MAP', MAP(labels))
+    print (eval_name + ' Performance MRR', MRR(labels))
+    print (eval_name + ' Performance P@1', precision(1, labels))
+    print (eval_name + ' Performance P@5', precision(5, labels))  
+
+def do_eval(embedding_layer, eval_name, batch_first=False):
+    
+    if eval_name == 'Dev':
+        if is_android:
+            eval_data = dev_android
+        else:
+            eval_data = dev_data     
+            
+    elif eval_name == 'Test':
+        if is_android:
+            eval_data = test_android
+        else:
+            eval_data = test_data
+    
+    eval_map = {}
+    for qid_ in eval_data.keys():
+        eval_map[qid_] = process_eval_batch(qid_, eval_data, batch_first=batch_first)
+
+    labels = []
+    if is_android:
+        auc = AUCMeter()
+    total = len(eval_map)
+    print(len(eval_map))
+    i = 0
+    c = 0
+    for qid_ in eval_map.keys():
+        eval_title_batch, eval_body_batch, eval_title_len, eval_body_len = eval_map[qid_] # process_eval_batch(qid_, eval_data)
+        embedding_layer.title_hidden = embedding_layer.init_hidden(eval_title_batch.shape[1])
+        embedding_layer.body_hidden = embedding_layer.init_hidden(eval_body_batch.shape[1])
+        eval_title_qs = Variable(torch.FloatTensor(eval_title_batch))
+        eval_body_qs = Variable(torch.FloatTensor(eval_body_batch))
+
+        if cuda_available:
+            eval_title_qs, eval_body_qs = eval_title_qs.cuda(), eval_body_qs.cuda()
+        embeddings = embedding_layer(eval_title_qs, eval_body_qs, eval_title_len, eval_body_len)
+        cos_scores = evaluate(embeddings).cpu().data.numpy()
+        true_labels = np.array(eval_data[qid_]['label'])
+        if is_android:
+            auc.add(cos_scores, true_labels)
+        labels.append(true_labels[np.argsort(cos_scores)][::-1])
+        
+        i += 1
+        if i % (total // 10) == 0:
+            c += 10
+            print('Progress {}%'.format(c))
+    
+    if is_android: # evaluate auc
+        print(eval_name + ' AUC ' + str(auc.value(0.05)))
+        del auc
+
+    eval_metrics(labels, eval_name)
+    # print (eval_name + ' Performance MAP', MAP(labels))
+    # print (eval_name + ' Performance MRR', MRR(labels))
+    # print (eval_name + ' Performance P@1', precision(1, labels))
+    # print (eval_name + ' Performance P@5', precision(5, labels))
+
+
+
+
+# dev_map = {}
+# for qid_ in dev_data.keys():
+#     dev_map[qid_] = process_eval_batch(qid_, dev_data)
+
+# test_map = {}
+# for qid_ in test_data.keys():
+#     test_map[qid_] = process_eval_batch(qid_, test_data)
 
 def build_mask(seq_len):
     mask = []
@@ -402,7 +519,7 @@ def build_mask3d(seq_len, max_len):
         # only two word
         elif int(s) == 0:
             mask[:2, i] = np.ones((2, 1))
-        else: 
+        elif int(s) > 0: 
             mask[:int(s), i] = np.ones((int(s), 1))
     return mask
 
@@ -596,25 +713,37 @@ if __name__ == '__main__':
 
     print('batch_size={}, epoch={}, margin={}, model={}, hidden_size={}'.format( \
         batch_size, epoch, margin, model_option, HIDDEN_DIM))
-    print('Start Training...')
-    
+
     if model_option == 'lstm':
         model = EmbeddingLayer(200, HIDDEN_DIM*2, 'lstm')
         criterion = multi_margin_loss(hidden=model.hidden_size * 2)
-        if cuda_available:
-            model = model.cuda()
-        train(model_option, model, batch_size=batch_size, num_epoch=epoch, margin=margin)
     
     elif model_option == 'cnn':  
         model = EmbeddingLayer(200, HIDDEN_DIM, 'cnn')
-        # restore_model(model, 'models/lstm_bi_epoch=1_margin=0.3_hidden=667')
         criterion = multi_margin_loss(hidden=model.hidden_size)
-        if cuda_available:
-            model = model.cuda()
+
+    if restore is not None:
+        restore_model(model, restore)
+
+    if cuda_available:
+        model = model.cuda()
+    
+    if eval_only:
+        if model_option == 'lstm':
+            do_eval(model, 'Dev')
+            print ('------------------')
+            do_eval(model, 'Test')
+        elif model_option == 'cnn':
+            do_eval(model, 'Dev', batch_first=True)
+            print ('------------------')
+            do_eval(model, 'Test', batch_first=True)
+
+    else:
+        print('Start Training...')
         train(model_option, model, batch_size=batch_size, num_epoch=epoch, margin=margin)
-    print ('Saving Model...')
-    save_model(model, 'models/'+str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+'_backup')
-    print ('Done')
+        print ('Saving Model...')
+        save_model(model, 'models/'+str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+str(time.time()%100000)[:5])
+        print ('Done')
 
 
 
