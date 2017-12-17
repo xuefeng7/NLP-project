@@ -10,7 +10,7 @@ import re
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy import sparse as sp
-from meter import AUCMeter
+from meter import AUCMeter, MAP, MRR, precision
 
 def build_corpus(path):
     title_corpus = []
@@ -97,7 +97,6 @@ body_vec = vec.transform(android_body)
 # tf-idf transform
 
 tf_embedding = (title_vec + body_vec) / 2
-# print('Title Weight:', 1-i)
 dev = read_annotations('dev.pos.txt', 'dev.neg.txt', tf_embedding)
 test = read_annotations('test.pos.txt', 'test.neg.txt', tf_embedding)
 auc = AUCMeter()
