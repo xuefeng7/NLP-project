@@ -3,6 +3,7 @@ import string
 import numpy as np; np.random.seed(7)
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Variable
 from torch.utils.data import TensorDataset, DataLoader
 import re
@@ -11,6 +12,8 @@ from optparse import OptionParser
 import pickle as pkl
 import time
 from meter import AUCMeter, MAP, MRR, precision
+import logging
+
 
 parser = OptionParser()
 parser.add_option("--batch_size", dest="batch_size", default="25")
@@ -26,6 +29,10 @@ parser.add_option("--is_android", dest="is_android", default=False)
 parser.add_option("--eval_only", dest="eval_only", default=False)
 parser.add_option("--lamb", dest="lamb", default="1e-6")
 parser.add_option("--use_domain_classifier", dest="use_domain_classifier", default=True)
+parser.add_option("--offset", dest="offset", default="1")
+parser.add_option("--use_840_embedding", dest="use_840_embedding", default=False)
+parser.add_option("--use_joint_embedding", dest="use_joint_embedding", default=False)
+
 opts,args = parser.parse_args()
 
 batch_size = int(opts.batch_size)
@@ -40,31 +47,118 @@ restore_domain = opts.restore_domain
 is_android = opts.is_android
 eval_only = opts.eval_only
 lamb = float(opts.lamb)
-use_domain_classifier = opts.use_domain_classifier
+
+use_domain_classifier = False if opts.use_domain_classifier == 'False' else True
+use_840_embedding = False if opts.use_840_embedding == 'False' or not opts.use_840_embedding else True
+use_joint_embedding = False if opts.use_joint_embedding == 'False' or not opts.use_joint_embedding else True
+
 
 HIDDEN_DIM = hidden_size
 LAMDA = lamb
+offset = int(opts.offset)
 
 cuda_available = torch.cuda.is_available()
 
 print ('Cuda is available: {}'.format(cuda_available))
+
 
 w2i_map_path = 'data/glove/w2i_map.pkl'
 w2v_matrix_path = 'data/glove/w2v_matrix.pkl'
 android_context_repre_path = 'data/glove/android_context_repre.pkl'
 ubuntu_context_repre_path = 'data/glove/ubuntu_context_repre.pkl'
 
-with open(w2i_map_path, 'rb') as f:
-	w2i_map = pkl.load(f)
+def sen2w(sen):
+	processed = []
+	sen = sen.strip().split()
+	if len(sen) > 100:
+		sen = sen[:100]
+	for w in sen:
+		#ignore date
+		if re.match(r'\d{1,}-\d{1,}-\d{1,}', w):
+			continue
+		if re.match(r'\d{1,}:\d{1,}', w):
+			continue
+		
+		if w in w2i_map:
+			processed += [w]
+		else:
+			separated = re.findall(r"[^\W\d_]+|\d+|[=`%$\^\-@;\[&_*>\].<~|+\d+]", w)
+			if len(set(separated)) == 1:
+				continue
+			if separated.count('*') > 3 or separated.count('=') > 3:
+				continue
+			for separate_w in separated:
+				if separate_w in w2i_map:
+					processed += [separate_w]
+	return processed
 
-with open(w2v_matrix_path, 'rb') as f:
-	w2v_matrix = pkl.load(f)
+def build_context_repre(path):
+	context_repre = {}
+	with open('data/' + path, 'r') as src:
+		src = src.read().strip().split('\n')
+		for line in src:
+			context = line.strip().split('\t')
+			qid = context.pop(0)
+			if len(context) == 1:
+				context_repre[int(qid)] = {'t': sen2w(context[0]), 'b': None}
+			else:
+				context_repre[int(qid)] = {'t':sen2w(context[0]), 'b': sen2w(context[1])}
+	return context_repre
 
-with open(ubuntu_context_repre_path, 'rb') as f:
-	ubuntu_context_repre = pkl.load(f)
 
-with open(android_context_repre_path, 'rb') as f:
-	android_context_repre = pkl.load(f)
+if use_840_embedding:
+
+	print ('using 840B embedding')
+	EMBEDDING_DIM = 300
+	print ('loading 840b w2i ...')
+	with open('data/glove/840b.w2i.pkl', 'rb') as f:
+		w2i_map = pkl.load(f)
+	print ('loading 840b w2v matrix ...')
+	with open('data/glove/840b.npy', 'rb') as f:
+		w2v_matrix = np.load(f)
+	print ('done')
+	print ('building context repre for ubuntu ...')
+	ubuntu_context_repre = build_context_repre('ubuntu/text_tokenized.txt')
+	print ('building context repre for android ...')
+	android_context_repre = build_context_repre('android/corpus.tsv')
+
+elif use_joint_embedding:
+
+	print ('using joint embedding')
+	EMBEDDING_DIM = 300
+	print ('loading joint 300 w2i ...')
+	with open('data/glove/joint.w2i.300.pkl', 'rb') as f:
+		w2i_map = pkl.load(f)
+	print ('loading joint 300 w2v matrix ...')
+	with open('data/glove/joint.w2v.300.pkl', 'rb') as f:
+		w2v_matrix = np.load(f)
+	print ('done')
+	print ('building context repre for ubuntu ...')
+	ubuntu_context_repre = build_context_repre('ubuntu/text_tokenized.txt')
+	print ('building context repre for android ...')
+	android_context_repre = build_context_repre('android/corpus.tsv')
+
+else:
+
+	EMBEDDING_DIM = 200
+
+	with open(w2i_map_path, 'rb') as f:
+		w2i_map = pkl.load(f)
+
+	with open(w2v_matrix_path, 'rb') as f:
+		w2v_matrix = pkl.load(f)
+
+	with open(ubuntu_context_repre_path, 'rb') as f:
+		ubuntu_context_repre = pkl.load(f)
+
+	with open(android_context_repre_path, 'rb') as f:
+		android_context_repre = pkl.load(f)
+
+
+# logging
+log_filename = 'mdl' + '_margin=' + str(margin) + '_lamb=' + str(lamb) + \
+	'_emb_dim=' + str(EMBEDDING_DIM) + '_use_dc=' + str(use_domain_classifier) + str(time.time()%100000)[:5]
+logging.basicConfig(filename='logs/' + log_filename + '.out', filemode='w', level=logging.DEBUG)
 
 def w2v(w):
 	return w2v_matrix[w2i_map[w]]
@@ -110,13 +204,13 @@ def contxt2vec(title, body=None):
 	if body == None:
 		body = []
 	
-	title_v = np.zeros( (len(title), 200) )
+	title_v = np.zeros( (len(title), EMBEDDING_DIM) )
 	
 	for i, t in enumerate(title):
 		title_v[i] = w2v(t)
 	
 	if len(body) > 0:
-		body_v = np.zeros( (len(body), 200) )
+		body_v = np.zeros( (len(body), EMBEDDING_DIM) )
 		for i, b in enumerate(body):
 			body_v[i] = w2v(b)
 	
@@ -151,8 +245,8 @@ def sample_contxt_batch(context_repre, sample_size=128, batch_first=False):
 		
 	if batch_first:
 		# for CNN
-		padded_batch_title = np.zeros(( len(batch_title), max_title_len, 200)) 
-		padded_batch_body = np.zeros(( len(batch_body),  max_body_len, 200))
+		padded_batch_title = np.zeros(( len(batch_title), max_title_len, EMBEDDING_DIM)) 
+		padded_batch_body = np.zeros(( len(batch_body),  max_body_len, EMBEDDING_DIM))
 		for i, (title, body) in enumerate(zip(batch_title, batch_body)):
 			title_repre, body_repre = contxt2vec(title, body)
 			padded_batch_title[i, :title_len[i]] = title_repre
@@ -160,8 +254,8 @@ def sample_contxt_batch(context_repre, sample_size=128, batch_first=False):
 	else:
 		# for LSTM
 		# (max_seq_len, batch_size, feature_len)
-		padded_batch_title = np.zeros(( max_title_len, len(batch_title), 200)) 
-		padded_batch_body = np.zeros(( max_body_len, len(batch_body),  200))
+		padded_batch_title = np.zeros(( max_title_len, len(batch_title), EMBEDDING_DIM)) 
+		padded_batch_body = np.zeros(( max_body_len, len(batch_body),  EMBEDDING_DIM))
 		for i, (title, body) in enumerate(zip(batch_title, batch_body)):
 			title_repre, body_repre = contxt2vec(title, body)
 			padded_batch_title[:title_len[i], i] = title_repre
@@ -229,8 +323,8 @@ def process_contxt_batch(qids, idx_set, context_repre, batch_first=False):
 	
 	if batch_first:
 		# for CNN
-		padded_batch_title = np.zeros(( len(batch_title), max_title_len, 200)) 
-		padded_batch_body = np.zeros(( len(batch_body),  max_body_len, 200))
+		padded_batch_title = np.zeros(( len(batch_title), max_title_len, EMBEDDING_DIM)) 
+		padded_batch_body = np.zeros(( len(batch_body),  max_body_len, EMBEDDING_DIM))
 		for i, (title, body) in enumerate(zip(batch_title, batch_body)):
 			title_repre, body_repre = contxt2vec(title, body)
 			padded_batch_title[i, :title_len[i]] = title_repre
@@ -238,8 +332,8 @@ def process_contxt_batch(qids, idx_set, context_repre, batch_first=False):
 	else:
 		# for LSTM
 		# (max_seq_len, batch_size, feature_len)
-		padded_batch_title = np.zeros(( max_title_len, len(batch_title), 200)) 
-		padded_batch_body = np.zeros(( max_body_len, len(batch_body),  200))
+		padded_batch_title = np.zeros(( max_title_len, len(batch_title), EMBEDDING_DIM)) 
+		padded_batch_body = np.zeros(( max_body_len, len(batch_body),  EMBEDDING_DIM))
 		for i, (title, body) in enumerate(zip(batch_title, batch_body)):
 			title_repre, body_repre = contxt2vec(title, body)
 			padded_batch_title[:title_len[i], i] = title_repre
@@ -277,15 +371,15 @@ def process_eval_batch(qid, data, batch_first=False):
 			max_body_len = max(max_body_len, len(body))
 			
 	if batch_first:
-		padded_batch_title = np.zeros(( len(batch_title), max_title_len, 200)) 
-		padded_batch_body = np.zeros(( len(batch_body),  max_body_len, 200))
+		padded_batch_title = np.zeros(( len(batch_title), max_title_len, EMBEDDING_DIM)) 
+		padded_batch_body = np.zeros(( len(batch_body),  max_body_len, EMBEDDING_DIM))
 		for i, (title, body) in enumerate(zip(batch_title, batch_body)):
 			title_repre, body_repre = contxt2vec(title, body)
 			padded_batch_title[i, :title_len[i]] = title_repre
 			padded_batch_body[i, :body_len[i]] = body_repre
 	else:
-		padded_batch_title = np.zeros(( max_title_len, len(batch_title), 200)) 
-		padded_batch_body = np.zeros(( max_body_len, len(batch_body),  200))
+		padded_batch_title = np.zeros(( max_title_len, len(batch_title), EMBEDDING_DIM)) 
+		padded_batch_body = np.zeros(( max_body_len, len(batch_body),  EMBEDDING_DIM))
 		for i, (title, body) in enumerate(zip(batch_title, batch_body)):
 			title_repre, body_repre = contxt2vec(title, body)
 			padded_batch_title[:title_len[i], i] = title_repre
@@ -312,17 +406,20 @@ class DomainClassifer(nn.Module):
 		
 		super(DomainClassifer, self).__init__()
 		
-		self.hidden_size = hidden_size
 		self.domain_classifier = nn.Sequential(
-			nn.Linear(input_size, hidden_size),
-			nn.BatchNorm1d(hidden_size),
-			nn.ReLU(),
-			nn.Linear(hidden_size, num_classes),
-			nn.LogSoftmax()
+		  nn.Linear(input_size, 300),
+		  nn.BatchNorm1d(300),
+		  nn.ReLU(),
+		  nn.Linear(300, hidden_size),
+		  nn.ReLU(),
+		  nn.Linear(hidden_size, num_classes),
+		  nn.LogSoftmax()
 		)
 
+
 	def forward(self, embedding):
-		# embedding = grad_reverse(embedding)
+
+		embedding = grad_reverse(embedding)
 		return self.domain_classifier(embedding)
 
 
@@ -352,6 +449,7 @@ class EmbeddingLayer(nn.Module):
 						nn.Conv1d(in_channels = self.input_size,
 								  out_channels = self.hidden_size,
 								  kernel_size = self.kernel_size),
+						nn.Dropout(p=0.2),
 						self.tanh)
 
 	def init_hidden(self, batch_size):
@@ -362,7 +460,7 @@ class EmbeddingLayer(nn.Module):
 			memory = memory.cuda()
 		return (hidden, memory)
 		# return (Variable(torch.zeros(self.num_layer*2, batch_size, self.hidden_size)), \
-		# 		Variable(torch.zeros(self.num_layer*2, batch_size, self.hidden_size)))
+		#       Variable(torch.zeros(self.num_layer*2, batch_size, self.hidden_size)))
 
 	def forward(self, title, body, title_len, body_len):
 		
@@ -400,9 +498,11 @@ class EmbeddingLayer(nn.Module):
 		if cuda_available:
 			title_mask = title_mask.cuda()
 			body_mask = body_mask.cuda()
+
 		title_embeddings = torch.sum(title_out * title_mask, dim=0) / torch.sum(title_mask, dim=0)
 		body_embeddings = torch.sum(body_out * body_mask, dim=0) / torch.sum(body_mask, dim=0)
 		embeddings = ( title_embeddings + body_embeddings ) / 2
+
 		if cuda_available:
 			embeddings = embeddings.cuda()
 		return embeddings
@@ -411,12 +511,12 @@ def build_mask3d(seq_len, max_len):
 	mask = np.zeros((max_len, len(seq_len), 1))
 	for i, s in enumerate(seq_len):
 		# only one word
-		if int(s) == -1:
+		if int(s) <= -1:
 			mask[0, i] = 1
 		# only two word
 		elif int(s) == 0:
 			mask[:2, i] = np.ones((2, 1))
-		else: 
+		elif int(s) > 0: 
 			mask[:int(s), i] = np.ones((int(s), 1))
 	return mask
 
@@ -441,6 +541,12 @@ def multi_margin_loss(hidden, margin=0.50):
 		return loss
 
 	return loss_func
+
+def accuracy(output, target):
+	output = torch.max(output, 1)[1]
+	# torch.squeeze(output > 0.5)#torch.max(output, 1)[1]
+	# return torch.sum(output.float().data == target.data) / target.data.shape[0]
+	return torch.sum(output.data == target.data) / output.data.shape[0]
 
 def read_annotations_android(pos_path, neg_path, max_neg=20):
 	dic = {}
@@ -476,10 +582,18 @@ dev_android = read_annotations_android('dev.pos.txt', 'dev.neg.txt')
 test_android = read_annotations_android('test.pos.txt', 'test.neg.txt')
 
 def eval_metrics(labels, eval_name):
-	print (eval_name + ' Performance MAP', MAP(labels))
-	print (eval_name + ' Performance MRR', MRR(labels))
-	print (eval_name + ' Performance P@1', precision(1, labels))
-	print (eval_name + ' Performance P@5', precision(5, labels))  
+
+	map_stdout = eval_name + ' Performance MAP ' +  str(MAP(labels))
+	mrr_stdout = eval_name + ' Performance MRR ' +  str(MRR(labels))
+	p1_stdout = eval_name + ' Performance P@1 ' + str(precision(1, labels))
+	p5_stdout = eval_name + ' Performance P@5 ' + str(precision(5, labels))
+
+	print (map_stdout + '\n' + mrr_stdout + '\n' + p1_stdout + '\n' + p5_stdout)
+
+	logging.debug(map_stdout)
+	logging.debug(mrr_stdout)
+	logging.debug(p1_stdout)
+	logging.debug(p5_stdout)
 
 def do_eval(embedding_layer, eval_name, batch_first=False):
 	
@@ -495,10 +609,7 @@ def do_eval(embedding_layer, eval_name, batch_first=False):
 
 	labels = []
 	auc = AUCMeter()
-	# total = len(eval_map)
-	# print(len(eval_map))
-	# i = 0
-	# c = 0
+
 	for qid_ in eval_map.keys():
 		eval_title_batch, eval_body_batch, eval_title_len, eval_body_len = eval_map[qid_] # process_eval_batch(qid_, eval_data)
 		embedding_layer.title_hidden = embedding_layer.init_hidden(eval_title_batch.shape[1])
@@ -513,19 +624,87 @@ def do_eval(embedding_layer, eval_name, batch_first=False):
 		true_labels = np.array(eval_data[qid_]['label'])
 		auc.add(cos_scores, true_labels)
 		labels.append(true_labels[np.argsort(cos_scores)][::-1])
-		
-		# i += 1
-		# if i % (total // 10) == 0:
-		# 	c += 10
-		# 	print('Progress {}%'.format(c))
+
 	
-	print(eval_name + ' AUC ' + str(auc.value(0.05)))
+	auc_stdout = eval_name + ' AUC ' + str(auc.value(0.05))
+	print(auc_stdout)
+	logging.debug(auc_stdout)
 	eval_metrics(labels, eval_name)
+	return auc.value(0.05)
+
+def create_target_batch(src, tareget, sample_size=128, batch_first=False):
+
+	sampled_src_qids = np.random.choice(list(src.keys()), sample_size)
+	sampled_target_qids = np.random.choice(list(tareget.keys()), sample_size)
+	
+	batch_title, batch_body = [], []
+	max_title_len, max_body_len = 0, 0
+	title_len, body_len = [], []
+
+	labels = []
+	
+	for qid in sampled_src_qids:
+		
+		title, body = src[qid]['t'], src[qid]['b']
+		
+		title_len += [len(title)]
+		batch_title += [ title ]
+		max_title_len = max(max_title_len, len(title))
+		
+		if not body:
+			body_len += [len(title)]
+			batch_body += [ title ]
+		else:
+			batch_body += [ body ]
+			body_len += [len(body)]
+			max_body_len = max(max_body_len, len(body))
+
+		labels += [0]
+
+	for qid in sampled_target_qids:
+
+		title, body = tareget[qid]['t'], tareget[qid]['b']
+		
+		title_len += [len(title)]
+		batch_title += [ title ]
+		max_title_len = max(max_title_len, len(title))
+		
+		if not body:
+			body_len += [len(title)]
+			batch_body += [ title ]
+		else:
+			batch_body += [ body ]
+			body_len += [len(body)]
+			max_body_len = max(max_body_len, len(body))
+
+		labels += [1]
+
+		
+	if batch_first:
+		# for CNN
+		padded_batch_title = np.zeros(( len(batch_title), max_title_len, EMBEDDING_DIM)) 
+		padded_batch_body = np.zeros(( len(batch_body),  max_body_len, EMBEDDING_DIM))
+		for i, (title, body) in enumerate(zip(batch_title, batch_body)):
+			title_repre, body_repre = contxt2vec(title, body)
+			padded_batch_title[i, :title_len[i]] = title_repre
+			padded_batch_body[i, :body_len[i]] = body_repre
+	else:
+		# for LSTM
+		# (max_seq_len, batch_size, feature_len)
+		padded_batch_title = np.zeros(( max_title_len, len(batch_title), EMBEDDING_DIM)) 
+		padded_batch_body = np.zeros(( max_body_len, len(batch_body),  EMBEDDING_DIM))
+		for i, (title, body) in enumerate(zip(batch_title, batch_body)):
+			title_repre, body_repre = contxt2vec(title, body)
+			padded_batch_title[:title_len[i], i] = title_repre
+			padded_batch_body[:body_len[i], i] = body_repre
+
+	return padded_batch_title, padded_batch_body, \
+				np.array(title_len).reshape(-1,1), np.array(body_len).reshape(-1,1), np.array(labels)
 
 
 def train( 
 	embedding_layer, domain_classifier, 
-	emb_batch_size=25, dc_batch_size=25,
+	emb_batch_size=25, dc_batch_size=100,
 	num_epoch=100, lamda=1e-3,
 	id_set=None,train_from=None,sample_from=None,
 	eval=True,
@@ -541,13 +720,15 @@ def train(
 		margin_criterion = multi_margin_loss(hidden=embedding_layer.hidden_size, margin=margin)
 	
 	emb_optimizer = torch.optim.Adam(embedding_layer.parameters(), lr=0.001)
+	
 	if domain_classifier is not None:
 		domain_criterion = torch.nn.NLLLoss()
-		domain_optimizer = torch.optim.Adam(domain_classifier.parameters(), lr=0.001)
+		params = list(embedding_layer.parameters()) + list(domain_classifier.parameters())
+		domain_optimizer = torch.optim.Adam(params, lr=0.0001)
 	
 	qids = list(id_set.keys())
 	num_batch = len(qids) // emb_batch_size
-	offset = 1
+	
 	last_loss = np.inf
 	for epoch in range(offset, num_epoch + offset):
 		cumulative_loss = 0
@@ -565,95 +746,117 @@ def train(
 				batch_title, batch_body, title_len, body_len = process_contxt_batch(batch_x_qids, \
 																				id_set, train_from, batch_first=True)
 			
-			src_title_qs = Variable(torch.FloatTensor(batch_title))
-			src_body_qs = Variable(torch.FloatTensor(batch_body))
+			title_qs = Variable(torch.FloatTensor(batch_title))
+			body_qs = Variable(torch.FloatTensor(batch_body))
 			if cuda_available:
-				src_title_qs, src_body_qs = src_title_qs.cuda(), src_body_qs.cuda()
-			src_embeddings = embedding_layer(src_title_qs, src_body_qs, title_len, body_len) # class label = ubuntu
+				title_qs = title_qs.cuda()
+				body_qs = body_qs.cuda()
+			embeddings = embedding_layer(title_qs, body_qs, title_len, body_len) # class label = ubuntu
 			
-			margin_loss = margin_criterion(src_embeddings)
+			margin_loss = margin_criterion(embeddings)
 			if cuda_available:
 				margin_loss = margin_loss.cuda()
 
+			emb_optimizer.zero_grad()
+			margin_loss.backward()
+			emb_optimizer.step()
+
 			if domain_classifier is None:
 				loss = margin_loss
-			else:	
+			else:   
 				## Domain classification
+				# sample title, body from two domains
 				if embedding_layer.layer_type == 'lstm':
-					batch_title, batch_body, title_len, body_len = sample_contxt_batch(sample_from, \
-																					   sample_size=dc_batch_size)
+
+					## mixed
+					batch_title, batch_body, title_len, body_len, labels = create_target_batch(train_from, sample_from, \
+							sample_size=dc_batch_size)
+		
+				else:
+
+					batch_title, batch_body, title_len, body_len, labels = create_target_batch(train_from, sample_from, \
+							sample_size=dc_batch_size, batch_first=True)
+
+
+				# mix
+				title_qs = Variable(torch.FloatTensor(batch_title))
+				body_qs = Variable(torch.FloatTensor(batch_body))
+
+				if cuda_available:
+					title_qs, body_qs = title_qs.cuda(), body_qs.cuda()
+
+				if embedding_layer.layer_type == 'lstm':
 					embedding_layer.title_hidden = embedding_layer.init_hidden(batch_title.shape[1])
 					embedding_layer.body_hidden = embedding_layer.init_hidden(batch_body.shape[1])
-				else:
-					batch_title, batch_body, title_len, body_len = sample_contxt_batch(sample_from, \
-																				   batch_first=True)
-			
-				# sample title, body from android dataset
-				target_title_qs = Variable(torch.FloatTensor(batch_title))
-				target_body_qs = Variable(torch.FloatTensor(batch_body))
-				# class label = android
-				if cuda_available:
-					target_title_qs, target_body_qs = target_title_qs.cuda(), target_body_qs.cuda()
-				target_embeddings = embedding_layer(target_title_qs, target_body_qs, title_len, body_len) 
-				embedding_X = torch.cat((src_embeddings[:dc_batch_size], target_embeddings), 0)
 
-				src_label = torch.zeros(dc_batch_size).type(torch.LongTensor)
-				target_label = torch.ones(dc_batch_size).type(torch.LongTensor)
-				embedding_Y = torch.cat((src_label, target_label), 0)
+				embedding_X = embedding_layer(title_qs, body_qs, title_len, body_len) 
+				embedding_Y = Variable(torch.LongTensor(labels))
+
+				if cuda_available:
+					embedding_X, embedding_Y = embedding_X.cuda(), embedding_Y.cuda()
 				
-				# prepare for shuffle
-				train_loader = DataLoader(TensorDataset(embedding_X.data, embedding_Y), \
-										  batch_size=embedding_Y.size(0), shuffle=True)
-				
-				for x, y in train_loader:
-					x, y = Variable(x), Variable(y)
-					if cuda_available:
-						x, y = x.cuda(), y.cuda()
-					domain_loss = domain_criterion(domain_classifier(x), y)
-			
-				loss = margin_loss - lamda * domain_loss
-			
-			if batch_idx % 20 == 1:
-				print ('epoch:{}/{}, batch:{}/{}, loss:{}'.format(epoch, num_epoch+offset, \
-															  batch_idx, num_batch, loss.data[0]))
+				predicted = domain_classifier(embedding_X)
+				domain_loss = domain_criterion(predicted, embedding_Y)
+
 			cumulative_loss += loss.cpu().data.numpy()[0]
-			if cuda_available:
-				loss = loss.cuda()
-			
-			emb_optimizer.zero_grad()
+			if batch_idx % 20 == 1:
+
+				if domain_classifier is None:
+					loss_stdout  = 'epoch:{}/{}, batch:{}/{}, loss:{}'.format(epoch, num_epoch+offset-1, \
+															  batch_idx, num_batch, loss.cpu().data[0])
+				else:
+
+					loss_stdout = 'epoch:{}/{}, batch:{}/{}, margin_loss:{}, domain_loss:{}'.format(epoch, num_epoch+offset-1, \
+															  batch_idx, num_batch, margin_loss.cpu().data[0], \
+															  domain_loss.cpu().data[0])
+					domain_acc = accuracy(predicted, embedding_Y)
+					loss_stdout += (', domain_acc:' + str(domain_acc))
+					
+				
+				print (loss_stdout)
+				logging.debug(loss_stdout)
+
+
 			if domain_classifier is not None:
+				if cuda_available:
+					domain_loss = domain_loss.cuda()
+				
 				domain_optimizer.zero_grad()
-			loss.backward()
-			emb_optimizer.step()
-			if domain_classifier is not None:
+				domain_loss.backward()
 				domain_optimizer.step()
+
 
 			if batch_idx % print_every == 0: 
 				print ('evaluating ....')
 				if embedding_layer.layer_type == 'lstm':
 					do_eval(embedding_layer, 'Dev')
+					do_eval(embedding_layer, 'Test')
 					# print ('------------------')
 					# do_eval(embedding_layer, 'Test')
 				elif embedding_layer.layer_type == 'cnn':
 					do_eval(embedding_layer, 'Dev', batch_first=True)
+					do_eval(embedding_layer, 'Test', batch_first=True)
 					# print ('------------------')
 					# do_eval(embedding_layer, 'Test', batch_first=True)
 
 		print ('Epoch {} is finished'.format(epoch))
-		print ('Saving Model...')
-		save_model(embedding_layer, 'models/'+'DC1_' + str(use_domain_classifier) + '_' + str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+str(time.time()%100000)[:5])
-		print ('Cumulative loss', cumulative_loss)
-		if domain_classifier is not None:
-			save_model(domain_classifier, 'models/'+'DC2_' + str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+str(time.time()%100000)[:5])
+		
 		print ('evaluating ....')
 		if embedding_layer.layer_type == 'lstm':
-			do_eval(embedding_layer, 'Dev')
-			# print ('------------------')
-			# do_eval(embedding_layer, 'Test')
+			dev_auc = do_eval(embedding_layer, 'Dev')
+			test_auc = do_eval(embedding_layer, 'Test')
 		elif embedding_layer.layer_type == 'cnn':
-			do_eval(embedding_layer, 'Dev', batch_first=True)
-				# print ('------------------')
-				# do_eval(embedding_layer, 'Test', batch_first=True)
+			dev_auc = do_eval(embedding_layer, 'Dev', batch_first=True)
+			test_auc = do_eval(embedding_layer, 'Test', batch_first=True)
+
+		print ('Saving Model...')
+		save_model(embedding_layer, 'models/'+'DC1_' + str(use_domain_classifier) + '_' + str(model_option)+'_bi_epoch=' + str(epoch)+\
+				'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+'_devauc=' + str(dev_auc)+'_testauc' + str(test_auc))
+		print ('Cumulative loss', cumulative_loss)
+		if domain_classifier is not None:
+			save_model(domain_classifier, 'models/'+'DC2_' + str(model_option)+'_bi_epoch='+str(epoch)+ \
+				'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+ '_devauc=' + str(dev_auc)+'_testauc' + str(test_auc))
+
 		if cumulative_loss < last_loss:
 			last_loss = cumulative_loss
 		else:
@@ -677,14 +880,7 @@ def restore_model(mdl_skeleton, path):
 if __name__ == '__main__':
 	print('batch_size={}, epoch={}, margin={}, model={}, hidden_size={}'.format( \
 		batch_size, epoch, margin, model_option, HIDDEN_DIM))
-	model = EmbeddingLayer(200, HIDDEN_DIM, model_option)
-
-	# if model_option == 'lstm':
-	# 	model = EmbeddingLayer(200, HIDDEN_DIM*2, 'lstm')
-	# 	# criterion = multi_margin_loss(hidden=model.hidden_size * 2)
-	# elif model_option == 'cnn':  
-	# 	model = EmbeddingLayer(200, HIDDEN_DIM, 'cnn')
-	# 	# criterion = multi_margin_loss(hidden=model.hidden_size)
+	model = EmbeddingLayer(EMBEDDING_DIM, HIDDEN_DIM, model_option)
 
 	if restore is not None:
 		restore_model(model, restore)
@@ -704,10 +900,9 @@ if __name__ == '__main__':
 
 	else:
 		print('Start Training...')
-		# train(model_option, model, batch_size=batch_size, num_epoch=epoch, margin=margin)
 		if use_domain_classifier:
 			if model_option == 'lstm':
-				domain_classifier = DomainClassifer(HIDDEN_DIM*2, hidden_size=128, num_classes=2)
+				domain_classifier = DomainClassifer(HIDDEN_DIM * 2, hidden_size=128, num_classes=2)
 			else:
 				domain_classifier = DomainClassifer(HIDDEN_DIM, hidden_size=128, num_classes=2)
 			if restore_domain:
@@ -716,6 +911,7 @@ if __name__ == '__main__':
 				domain_classifier = domain_classifier.cuda()
 		else:
 			domain_classifier = None
+		
 		train( 
 			model, 
 			domain_classifier, 
@@ -728,23 +924,13 @@ if __name__ == '__main__':
 			num_epoch=epoch
 		)
 		print ('Saving Model...')
-		save_model(model, 'models/'+'DC1_final' + str(use_domain_classifier) + '_' + str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+str(time.time()%100000)[:5])
+		save_mdl_path = 'models/'+'DC1_final' + str(use_domain_classifier) + '_' + str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+\
+			str(HIDDEN_DIM)+str(time.time()%100000)[:5]
+		save_model(model, save_mdl_path)
+		logging.debug('dc mdl is saved to:' + save_mdl_path)
 		if use_domain_classifier:
-			save_model(domain_classifier, 'models/'+'DC2_final' + str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+str(HIDDEN_DIM)+str(time.time()%100000)[:5])
+			save_mdl_path =  'models/'+'DC2_final' + str(model_option)+'_bi_epoch='+str(epoch)+'_margin='+str(margin)+'_hidden='+\
+				str(HIDDEN_DIM)+str(time.time()%100000)[:5]
+			save_model(domain_classifier, save_mdl_path)
+			logging.debug('dc mdl is saved to:' + save_mdl_path)
 		print ('Done')
-
-		
-
-
-
-
-
-
-
-
-
-
-
-
-
-
